@@ -1,0 +1,119 @@
+@import "./components/content-column.css";
+@import "./components/settings/shared/catalog-layout.css";
+@import "tailwindcss/base";
+@import "tailwindcss/components";
+@import "tailwindcss/utilities";
+
+/* Compile feature @layers together; unlayered overrides below the Tailwind imports win over utilities. */
+@import "./styles/tokens.css";
+@import "./styles/surfaces.css";
+@import "./styles/scrollbars.css";
+@import "./components/workbench/native-host.css";
+@import "./components/workbench/workbench-layout.css";
+@import "./components/thread/thread-viewport.css";
+@import "./components/thread/thread-history-status.css";
+@import "./components/markdown-content.css";
+@import "./components/ui/streaming-label-sheen.css";
+@import "./components/ui/disclosure.css";
+@import "./components/message-bubble.css";
+@import "./components/thread/message-actions.css";
+@import "./components/sidebar.css";
+@import "./components/thread/thread-composer.css";
+@import "./components/thread/model-preset-badge.css";
+@import "./components/ui/segmented-control.css";
+@import "./components/ui/control-treatments.css";
+@import "./components/thread/activity/activity-current.css";
+@import "./components/settings/shared/settings-layout.css";
+@import "./components/settings/system/automations-page.css";
+@import "./styles/custom-background.css";
+
+@font-face {
+  font-family: "Open Sans";
+  src: url("./assets/fonts/open-sans-variable.woff2") format("woff2");
+  font-style: normal;
+  font-weight: 300 800;
+  font-display: swap;
+}
+
+@font-face {
+  font-family: "Open Sans";
+  src: url("./assets/fonts/open-sans-variable-italic.woff2") format("woff2");
+  font-style: italic;
+  font-weight: 300 800;
+  font-display: swap;
+}
+
+@layer base {
+  * {
+    @apply border-border;
+  }
+
+  :focus-visible {
+    outline: 2px solid hsl(var(--ring) / 0.55);
+    outline-offset: 2px;
+  }
+
+  *,
+  ::before,
+  ::after {
+    corner-shape: var(--corner-shape);
+  }
+
+  html,
+  body,
+  #root {
+    @apply h-full;
+  }
+
+  body {
+    @apply bg-background text-foreground font-sans antialiased;
+    overflow: hidden;
+    text-autospace: normal;
+  }
+
+  .text-reading,
+  .text-reading-small,
+  .text-composer,
+  .markdown-content {
+    font-family: "Open Sans", sans-serif;
+  }
+
+  /* Keep source text and editable values visually literal. */
+  pre,
+  code,
+  kbd,
+  samp,
+  .font-mono,
+  input,
+  textarea,
+  [contenteditable="true"] {
+    text-autospace: no-autospace;
+  }
+
+  ::selection {
+    @apply bg-primary/15;
+  }
+}
+
+@media (pointer: coarse) {
+  /* Readable form text avoids Safari's focus zoom without disabling the user's
+     pinch zoom. Keep this after utilities so compact desktop overrides cannot
+     shrink shared form fields on touch devices. Larger chat/search text stays
+     on its own typography; this is not a blanket rule for every input. */
+  .touch-text-input {
+    font-size: max(16px, 1rem);
+  }
+
+  .touch-target {
+    min-width: 2.75rem;
+    min-height: 2.75rem;
+  }
+}
+
+:root[data-focus-modality="pointer"] :focus-visible:not(
+  textarea,
+  [contenteditable],
+  input:not([type="button"], [type="submit"], [type="reset"], [type="checkbox"], [type="radio"], [type="range"], [type="file"], [type="color"], [type="image"])
+) {
+  outline: none;
+}

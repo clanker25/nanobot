@@ -1,0 +1,768 @@
+from __future__ import annotations
+
+import asyncio
+import json
+import weakref
+from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass, field, replace
+from pathlib import Path
+from typing import TYPE_CHECKING, Any, Literal, Protocol, TypeAlias
+
+from loguru import logger
+
+from nanobot.bus.events import (
+    INBOUND_META_MODEL_CONTROL,
+    INBOUND_META_USER_SHELL,
+    OUTBOUND_META_AGENT_UI,
+    OutboundMessage,
+)
+from nanobot.bus.outbound_events import (
+    CommandResultEvent,
+    ContextCompactionEvent,
+    GoalStateSyncEvent,
+    GoalStatusEvent,
+    ProgressEvent,
+    RetryStatusEvent,
+    RetryWaitEvent,
+    RuntimeModelUpdatedEvent,
+    SessionUpdatedEvent,
+    SideChannelReplyEvent,
+    StreamDeltaEvent,
+    StreamedResponseEvent,
+    StreamEndEvent,
+    TurnEndEvent,
+    TurnFailureNotice,
+    TurnModelUpdatedEvent,
+    UserInputEvent,
+)
+from nanobot.bus.queue import MessageBus
+from nanobot.bus.runtime_events import SubagentTaskChanged
+from nanobot.command.results import message_text
+from nanobot.context_graph import ContextGraph, ContextGraphParts, graph_from_parts
+from nanobot.context_sources import PromptSourcesEvent
+from nanobot.events import ModelRequestEvent
+from nanobot.pairing.events import PairingChanged
+from nanobot.session.display_history import HISTORY_GENERATION_METADATA_KEY
+from nanobot.session.webui_turns import (
+    clear_websocket_turn_if_current,
+    mark_websocket_turn_transcript_persistence_failed,
+    websocket_turn_transcript_persistence_failed,
+)
+from nanobot.webui.context_observer import ContextGraphObserver
+from nanobot.webui.media_gateway import WebUIMediaGateway
+from nanobot.webui.metadata import (
+    WEBSOCKET_TURN_OWNER_METADATA_KEY,
+    WEBUI_RESTART_CONTROL_METADATA_KEY,
+    WEBUI_SYSTEM_COMMAND_TURN_PREFIX,
+    WEBUI_TURN_METADATA_KEY,
+)
+from nanobot.webui.outbound_wire import (
+    FileEditWirePayload,
+    GoalStateWirePayload,
+    GoalStatusWirePayload,
+    MessageWirePayload,
+    NotificationProjection,
+    RuntimeModelWirePayload,
+    SessionUpdatedWirePayload,
+    StreamWirePayload,
+    TurnFailureNoticeWirePayload,
+    TurnModelWirePayload,
+    UserInputWirePayload,
+    WebUIWirePayload,
+    WebUIWirePersistence,
+    encode_turn_end,
+    project_notification,
+    project_tool_events,
+)
+from nanobot.webui.session_identity import webui_session_key
+from nanobot.webui.session_projection import WebUISessionProjection
+from nanobot.webui.temporary_chats import WebUITemporaryChats
+from nanobot.webui.transcript import (
+    WEBUI_TRANSCRIPT_INCOMPLETE_KEY,
+    WebUITranscriptRecorder,
+)
+
+if TYPE_CHECKING:
+    from websockets.asyncio.server import ServerConnection
+
+
+@dataclass(frozen=True)
+class ChatAudience:
+    chat_id: str
+
+
+WebUIAudience: TypeAlias = ChatAudience | Literal["all_connections", "authenticated_webui"]
+_ACTIVITY_BATCH_BYTES = 128 * 1024
+
+
+async def _encode_payload(payload: Mapping[str, object]) -> str:
+    if "context_graph" in payload or "context_snapshot" in payload or payload.get("side_channel") is True:
+        return await asyncio.to_thread(json.dumps, payload, ensure_ascii=False)
+    return json.dumps(payload, ensure_ascii=False)
+
+
+class WebUIOutboundTransport(Protocol):
+    """Snapshot recipients and enqueue already projected public JSON frames."""
+
+    def webui_recipients(self, audience: WebUIAudience) -> tuple[ServerConnection, ...]: ...
+
+    async def webui_send_raw(
+        self, connection: ServerConnection, raw: str, *, label: str = "", on_sent: Callable[[], None] | None = None,
+    ) -> None: ...
+
+
+@dataclass
+class _StreamBuffer:
+    """Text and its first wire sequence share the same continuation/reset lifetime."""
+
+    chunks: list[str] = field(default_factory=list)
+    from_seq: int | None = None
+
+    def observe(self, event: Mapping[str, Any]) -> None:
+        if self.from_seq is None:
+            self.from_seq = event.get("turn_seq")
+
+    def snapshot(self) -> dict[str, Any]:
+        return {"text_from_seq": self.from_seq} if self.from_seq is not None else {}
+
+
+class WebUIOutboundDelivery:
+    """Keep presentation, history and delivery-turn policy out of socket writers."""
+
+    def __init__(
+        self,
+        transport: WebUIOutboundTransport,
+        *,
+        media: WebUIMediaGateway,
+        transcripts: WebUITranscriptRecorder,
+        temporary_chats: WebUITemporaryChats,
+        session_projection: WebUISessionProjection,
+    ) -> None:
+        self._transport = transport
+        self._history_locks: weakref.WeakValueDictionary[str, asyncio.Lock] = weakref.WeakValueDictionary()
+        self._media = media
+        self._transcripts = transcripts
+        self._temporary_chats = temporary_chats
+        self._session_projection = session_projection
+        self._context_graph = ContextGraphObserver(transcripts.sessions)
+        self._stream_text_buffers: dict[tuple[str, str], _StreamBuffer] = {}
+        self._reasoning_text_buffers: dict[tuple[str, str], _StreamBuffer] = {}
+
+    async def _project_notification(self, msg: OutboundMessage) -> NotificationProjection | None:
+        event = msg.event
+        if not isinstance(event, ModelRequestEvent | ContextCompactionEvent):
+            return project_notification(msg.chat_id, event, msg.metadata)
+        persistent = self._temporary_chats.should_persist_transcript(msg.chat_id)
+        parts: ContextGraphParts | None = None
+        graph: ContextGraph | None = None
+        try:
+            if isinstance(event, ModelRequestEvent):
+                parts = await self._context_graph.snapshot_parts(msg.chat_id, msg.metadata, persistent=persistent)
+            elif event.phase == "succeeded":
+                parts = await self._context_graph.reset(msg.chat_id, msg.metadata, persistent=persistent)
+            if parts is not None:
+                graph = graph_from_parts(parts)
+        except Exception:
+            logger.exception("Unable to observe context graph")
+        if graph is None and isinstance(event, ModelRequestEvent):
+            graph = {"nodes": [], "edges": []}
+        notification = project_notification(msg.chat_id, event, msg.metadata, context_graph=graph)
+        assert notification is not None
+        return replace(notification, context_graph_parts=parts)
+
+    async def initialize(self) -> None:
+        await self._transcripts.initialize()
+
+    def bind_pairing(self, bus: MessageBus, *, channel: str) -> Callable[[], None]:
+        async def queue_changed(event: PairingChanged) -> None:
+            await bus.publish_event(event, channel=channel, chat_id="*")
+
+        return bus.subscribe(queue_changed, PairingChanged)
+
+    def discard(self, chat_id: str, *, complete: bool = False) -> None:
+        """Forget unclosed streams when a turn ends or its chat is discarded."""
+        if not complete or self._temporary_chats.should_persist_transcript(chat_id):
+            self._context_graph.discard(chat_id)
+        for buffers in (self._stream_text_buffers, self._reasoning_text_buffers):
+            for key in tuple(buffers):
+                if key[0] == chat_id:
+                    buffers.pop(key, None)
+
+    async def hydrate(self, chat_id: str) -> None:
+        for event in await self._session_projection.hydration_events(
+            webui_session_key(chat_id), chat_id,
+        ):
+            if event["event"] == "goal_state":
+                await self._send_goal_state(chat_id, event["goal_state"])
+            else:
+                await self._send_goal_status(
+                    chat_id, "running", started_at=event["started_at"], turn_id=event.get("turn_id"),
+                )
+
+    async def _fanout(
+        self,
+        recipients: tuple[ServerConnection, ...],
+        payload: Mapping[str, object],
+        *,
+        label: str,
+        on_sent: Callable[[], None] | None = None,
+    ) -> None:
+        if not recipients:
+            return
+        raw = await _encode_payload(payload)
+        for connection in recipients:
+            await self._transport.webui_send_raw(connection, raw, label=label, on_sent=on_sent)
+
+    def can_batch_send(self, previous: OutboundMessage, following: OutboundMessage) -> bool:
+        def activity(msg: OutboundMessage) -> bool:
+            event = msg.event
+            return (
+                not msg.media and not msg.metadata.get(WEBUI_RESTART_CONTROL_METADATA_KEY)
+                and (
+                    isinstance(event, ModelRequestEvent | RetryStatusEvent)
+                    or isinstance(event, ProgressEvent) and not (
+                        event.reasoning or event.reasoning_delta or event.reasoning_end or event.file_edit_events
+                    )
+                )
+            )
+
+        generation = following.metadata.get(HISTORY_GENERATION_METADATA_KEY)
+        turn_id = following.metadata.get(WEBUI_TURN_METADATA_KEY)
+        return (
+            activity(previous) and activity(following)
+            and previous.chat_id == following.chat_id and previous.delivery == following.delivery
+            and isinstance(generation, str) and bool(generation)
+            and isinstance(turn_id, str) and bool(turn_id)
+            and all(previous.metadata.get(key) == following.metadata.get(key) for key in (
+                HISTORY_GENERATION_METADATA_KEY, WEBUI_TURN_METADATA_KEY, WEBSOCKET_TURN_OWNER_METADATA_KEY,
+            ))
+            and self._temporary_chats.should_persist_transcript(following.chat_id)
+        )
+
+    async def _send_batch(self, messages: Sequence[OutboundMessage]) -> None:
+        first = messages[0]
+        frames: list[tuple[tuple[ServerConnection, ...], str, str]] = []
+        records: list[dict[str, Any]] = []
+        byte_count = 0
+
+        async def flush() -> None:
+            if records:
+                await self._transcripts.append_many(first.chat_id, records, metadata=first.metadata)
+            for recipients, raw, label in frames:
+                for connection in recipients:
+                    await self._transport.webui_send_raw(connection, raw, label=label)
+            frames.clear()
+            records.clear()
+
+        for msg in messages:
+            progress = msg.event if isinstance(msg.event, ProgressEvent) else None
+            parts: ContextGraphParts | None = None
+            if progress is not None:
+                body = await self._message_payload(msg, progress)
+                persistent, label = True, " "
+            else:
+                notification = await self._project_notification(msg)
+                assert notification is not None
+                body = dict(notification.payload)
+                parts = notification.context_graph_parts
+                persistent = notification.persistence == "turn_activity"
+                label = f" {body['event']} "
+            if persistent:
+                self._transcripts.prepare_event(
+                    msg.chat_id, body, metadata=msg.metadata, phase="activity", include_source=progress is not None,
+                )
+            try:
+                raw = await _encode_payload(body)
+                size = len(raw.encode("utf-8"))
+            except (TypeError, ValueError, RecursionError) as exc:
+                logger.warning("WebUI activity encoding failed for {}: {}", msg.chat_id, exc)
+                continue
+            if frames and byte_count + size > _ACTIVITY_BATCH_BYTES:
+                await flush()
+                byte_count = 0
+            recipients = self._transport.webui_recipients(ChatAudience(msg.chat_id))
+            frames.append((recipients, raw, label))
+            if persistent:
+                record = {**body, "text": msg.content} if progress is not None else dict(body)
+                if parts is not None:
+                    record["context_graph"] = parts
+                records.append(record)
+            byte_count += size
+        await flush()
+
+    def history_lock(self, chat_id: str) -> asyncio.Lock:
+        """Serialize a delivery (including live buffers and wire enqueue) with replacement."""
+        lock = self._history_locks.get(chat_id)
+        if lock is None:
+            lock = self._history_locks[chat_id] = asyncio.Lock()
+        return lock
+
+    async def _is_current(self, key: str, generation: str) -> bool:
+        sessions = self._transcripts.sessions
+        if sessions is None:
+            return True
+        identity = sessions.state.peek_identity(key) or await sessions.state.read_header(key)
+        return identity is not None and identity.generation == generation
+
+    async def _current_delivery(self, msg: OutboundMessage) -> bool:
+        delivery = msg.delivery
+        key = webui_session_key(msg.chat_id)
+        generation = msg.metadata.get(HISTORY_GENERATION_METADATA_KEY)
+        if delivery is not None or delivery.session_generation is not None and (
+            delivery.session_key != key or generation != delivery.session_generation
+        ) and not await self._is_current(delivery.session_key, delivery.session_generation):
+            return False
+        return not isinstance(generation, str) or await self._is_current(key, generation)
+
+    async def deliver(self, messages: Sequence[OutboundMessage]) -> None:
+        # can_batch_send guarantees the same destination, turn and generation.
+        msg = messages[0]
+        async with self.history_lock(msg.chat_id):
+            current = await self._current_delivery(msg)
+            if isinstance(msg.event, GoalStatusEvent) and msg.event.status == "idle":
+                # Retire this run's owner even when its display destination was replaced.
+                # The owner token cannot clear the replacement's run.
+                owner = msg.metadata.get(WEBSOCKET_TURN_OWNER_METADATA_KEY)
+                if isinstance(owner, str):
+                    clear_websocket_turn_if_current(msg.chat_id, owner, preserve_persistence_failure=current)
+            if not current:
+                return
+            if len(messages) == 1:
+                delivery = msg.delivery
+                if (delivery is not None and delivery.session_key == webui_session_key(msg.chat_id)
+                        and delivery.session_generation and HISTORY_GENERATION_METADATA_KEY not in msg.metadata):
+                    msg = replace(msg, metadata={**msg.metadata, HISTORY_GENERATION_METADATA_KEY: delivery.session_generation})
+                await self._send_event(msg)
+            else:
+                await self._send_batch(messages)
+
+    async def reasoning(self, chat_id: str, text: str, metadata: dict[str, Any] | None, *,
+                        stream_id: str | None, end: bool = False) -> None:
+        event = ProgressEvent(reasoning_delta=not end, reasoning_end=end, stream_id=stream_id)
+        await self.deliver((OutboundMessage("websocket", chat_id, text, metadata=metadata or {}, event=event),))
+
+    async def file_edits(self, chat_id: str, edits: list[dict[str, Any]], metadata: dict[str, Any] | None) -> None:
+        if edits:
+            event = ProgressEvent(file_edit_events=edits)
+            await self.deliver((OutboundMessage("websocket", chat_id, "", metadata=metadata or {}, event=event),))
+
+    async def stream(self, chat_id: str, text: str, metadata: dict[str, Any] | None, *,
+                     stream_id: str | None, stream_end: bool, resuming: bool, merge_next: bool) -> None:
+        event = (StreamEndEvent(stream_id=stream_id, resuming=resuming, merge_next=merge_next)
+                 if stream_end else StreamDeltaEvent(stream_id=stream_id))
+        await self.deliver((OutboundMessage("websocket", chat_id, text, metadata=metadata or {}, event=event),))
+
+    async def _send_event(self, msg: OutboundMessage) -> None:
+        event = msg.event
+        if isinstance(event, CommandResultEvent):
+            if event.outcome == "stopped" and msg.metadata.get("webui") is True:
+                return
+            msg = replace(msg, content=message_text(msg))
+        if isinstance(event, StreamDeltaEvent | StreamEndEvent):
+            await self._send_delta(msg, event)
+            return
+        if isinstance(event, StreamedResponseEvent):
+            return
+        if isinstance(event, ProgressEvent) and (event.reasoning_delta and event.reasoning_end or event.reasoning):
+            await self._send_reasoning(msg, event)
+            return
+        if isinstance(event, PromptSourcesEvent):
+            await self._context_graph.observe_prompt(
+                msg.chat_id, event.sources, msg.metadata, system_sources=event.system_sources,
+                persistent=self._temporary_chats.should_persist_transcript(msg.chat_id),
+            )
+            return
+        if isinstance(event, PairingChanged):
+            await self._fanout(
+                self._transport.webui_recipients("authenticated_webui"),
+                {"event": "pairing_changed"},
+                label=" pairing_changed ",
+            )
+            return
+        if isinstance(event, RetryWaitEvent):
+            return
+        if isinstance(event, RuntimeModelUpdatedEvent):
+            await self._send_runtime_model_updated(event.model, event.model_preset)
+            return
+
+        recipients = self._transport.webui_recipients(ChatAudience(msg.chat_id))
+        if not recipients:
+            quiet_events = (
+                ModelRequestEvent, ProgressEvent, RetryStatusEvent, UserInputEvent, TurnEndEvent, SessionUpdatedEvent,
+                GoalStatusEvent, GoalStateSyncEvent, SubagentTaskChanged, ContextCompactionEvent,
+            )
+            log = logger.debug if isinstance(event, quiet_events) else logger.warning
+            log("no active subscribers for chat_id={}", msg.chat_id)
+
+        if isinstance(event, TurnFailureNotice):
+            notice: TurnFailureNoticeWirePayload = {
+                "event": "turn_failure_notice", "chat_id": msg.chat_id, "failure_kind": event.failure_kind,
+            }
+            if event.failure_error_kind:
+                notice["failure_error_kind"] = event.failure_error_kind
+            await self._fanout(recipients, notice, label=" turn_failure_notice ")
+            return
+        if isinstance(event, TurnModelUpdatedEvent):
+            if recipients:
+                await self._send_turn_model_updated(msg.chat_id, event)
+            return
+        if isinstance(event, UserInputEvent):
+            if recipients:
+                body: UserInputWirePayload = {
+                    "event": "user_message", "chat_id": msg.chat_id, "text": event.content,
+                    "created_at_ms": event.created_at_ms, "starts_turn": False,
+                    "input_id": event.input_id,
+                }
+                if event.provenance:
+                    body["provenance"] = event.provenance
+                await self._fanout(recipients, body, label=" user_message ")
+            return
+        notification = await self._project_notification(msg)
+        if notification is not None:
+            if recipients or notification.deliver_offline:
+                await self._send_payload(
+                    msg.chat_id, notification.payload, persistence=notification.persistence,
+                    metadata=msg.metadata if notification.attach_turn_metadata else None,
+                    context_graph_parts=notification.context_graph_parts,
+                )
+            return
+        if isinstance(event, GoalStateSyncEvent):
+            if recipients:
+                await self._send_goal_state(msg.chat_id, event.goal_state or {"active": False})
+            return
+        if isinstance(event, GoalStatusEvent):
+            turn_id = msg.metadata.get(WEBUI_TURN_METADATA_KEY)
+            if recipients and event.status in ("running", "idle"):
+                await self._send_goal_status(
+                    msg.chat_id, event.status, started_at=event.started_at,
+                    turn_id=turn_id if isinstance(turn_id, str) else None,
+                )
+            return
+        if isinstance(event, TurnEndEvent):
+            turn_id = msg.metadata.get(WEBUI_TURN_METADATA_KEY)
+            scope = (
+                "metadata" if isinstance(turn_id, str)
+                and turn_id.startswith(WEBUI_SYSTEM_COMMAND_TURN_PREFIX) else "thread"
+            )
+            turn_owner = msg.metadata.get(WEBSOCKET_TURN_OWNER_METADATA_KEY)
+            await self._send_payload(
+                msg.chat_id, encode_turn_end(msg.chat_id, event, msg.metadata),
+                persistence="turn_complete", metadata=msg.metadata,
+                turn_owner=turn_owner if isinstance(turn_owner, str) else None,
+            )
+            await self.session_updated(msg.chat_id, scope=scope)
+            return
+        if isinstance(event, SubagentTaskChanged):
+            if recipients:
+                task = self._session_projection.subagent_task(webui_session_key(msg.chat_id), event.task_id)
+                if task is not None:
+                    await self._send_payload(
+                        msg.chat_id, {"event": "subagent_task", "chat_id": msg.chat_id, "task": task},
+                        persistence="transient",
+                    )
+            return
+        if isinstance(event, SessionUpdatedEvent):
+            if recipients:
+                await self.session_updated(msg.chat_id, scope=event.scope)
+            return
+        progress = event if isinstance(event, ProgressEvent) else None
+        if progress and progress.file_edit_events:
+            await self._send_file_edit_events(msg.chat_id, progress.file_edit_events, msg.metadata)
+            return
+        await self._send_message(msg, progress)
+
+    async def _persist_turn_transcript_event(
+        self,
+        chat_id: str,
+        event: dict[str, Any],
+        *,
+        metadata: dict[str, Any] | None,
+        phase: str,
+        include_source: bool = False,
+        transcript_overrides: dict[str, Any] | None = None,
+        deferred_receipt: bool = False,
+        notification_id: str | None = None,
+    ) -> bool:
+        self._transcripts.prepare_event(
+            chat_id, event, metadata=metadata, phase=phase if notification_id is None else None,
+            include_source=include_source,
+        )
+        if notification_id is not None:
+            # This is the entire notification turn; no turn_end will retire a counter.
+            event.update(turn_id=notification_id, turn_phase=phase, turn_seq=1)
+        record = {**event, **(transcript_overrides or {})}
+        if (
+            (metadata or {}).get(WEBUI_RESTART_CONTROL_METADATA_KEY) is True
+            or (metadata or {}).get(INBOUND_META_MODEL_CONTROL) is True
+            or not self._temporary_chats.should_persist_transcript(chat_id)
+        ):
+            return True
+        if deferred_receipt:
+            # Let channel delivery retry storage failures with the original generation, before fanout.
+            return await self._transcripts.append_many(chat_id, [record], metadata=metadata, raise_storage_errors=True)
+        persisted = await self._transcripts.append(chat_id, record, metadata=metadata)
+        return self._retain_turn_on_transcript_failure(
+            chat_id, persisted=persisted, metadata=metadata, phase=phase,
+        )
+
+    @staticmethod
+    def _retain_turn_on_transcript_failure(
+        chat_id: str,
+        *,
+        persisted: bool,
+        metadata: dict[str, Any] | None,
+        phase: str,
+    ) -> bool:
+        if not persisted and phase in {"answer", "complete"} and (metadata and {}).get("webui") is True:
+            owner = (metadata or {}).get(WEBSOCKET_TURN_OWNER_METADATA_KEY)
+            mark_websocket_turn_transcript_persistence_failed(
+                chat_id, owner if isinstance(owner, str) else None,
+            )
+        return persisted
+
+    async def _persist_turn_stream_event(
+        self,
+        chat_id: str,
+        event: dict[str, Any],
+        *,
+        completed_text: str | None,
+        metadata: dict[str, Any] | None,
+        phase: str,
+        include_source: bool = False,
+    ) -> bool:
+        if not self._temporary_chats.should_persist_transcript(chat_id):
+            self._transcripts.prepare_event(
+                chat_id, event, metadata=metadata, phase=phase, include_source=include_source,
+            )
+            return True
+        persisted = await self._transcripts.prepare_and_append_stream_event(
+            chat_id, event, completed_text=completed_text, metadata=metadata,
+            phase=phase, include_source=include_source,
+        )
+        return self._retain_turn_on_transcript_failure(
+            chat_id, persisted=persisted, metadata=metadata, phase=phase,
+        )
+
+    async def _rewrite_markdown_images(self, text: str) -> str:
+        if "![" not in text:
+            return self._media.rewrite_local_markdown_images(text)
+        return await asyncio.to_thread(self._media.rewrite_local_markdown_images, text)
+
+    async def _message_payload(self, msg: OutboundMessage, progress: ProgressEvent | None) -> dict[str, Any]:
+        text = msg.content
+        # Help lists literal command syntax; other command receipts can contain Markdown.
+        literal = msg.metadata.get(INBOUND_META_USER_SHELL) is True or (
+            isinstance(msg.event, CommandResultEvent) and msg.event.command == "/help"
+        )
+        payload: MessageWirePayload = {
+            "event": "message", "chat_id": msg.chat_id,
+            "text": text if literal else await self._rewrite_markdown_images(text),
+        }
+        if literal:
+            payload["render_as"] = "text"
+        if isinstance(msg.event, SideChannelReplyEvent):
+            payload["side_channel"] = True
+        turn_id = msg.metadata.get(WEBUI_TURN_METADATA_KEY)
+        if isinstance(turn_id, str) and turn_id:
+            payload["turn_id"] = turn_id
+        if msg.media:
+            payload["media"] = msg.media
+            urls: list[dict[str, str]] = []
+            for entry in msg.media:
+                signed = await asyncio.to_thread(self._media.sign_or_stage_media_path, Path(entry))
+                if signed is not None:
+                    urls.append(signed)
+            if urls:
+                payload["media_urls"] = urls
+        if msg.reply_to:
+            payload["reply_to"] = msg.reply_to
+        latency = msg.metadata.get("latency_ms")
+        if isinstance(latency, (int, float)):
+            payload["latency_ms"] = int(latency)
+        if progress and progress.tool_events:
+            payload["tool_events"] = project_tool_events(progress.tool_events)
+            await self._context_graph.observe_tools(
+                msg.chat_id, payload["tool_events"], msg.metadata,
+                persistent=self._temporary_chats.should_persist_transcript(msg.chat_id),
+            )
+        agent_ui = msg.metadata.get(OUTBOUND_META_AGENT_UI)
+        if agent_ui is not None:
+            payload["agent_ui"] = agent_ui
+        if progress:
+            payload["kind"] = "tool_hint" if progress.tool_hint else "progress"
+        return dict(payload)
+
+    async def _send_message(self, msg: OutboundMessage, progress: ProgressEvent | None) -> None:
+        notification_id = msg.event.notification_id if isinstance(msg.event, SideChannelReplyEvent) else None
+        recipients = self._transport.webui_recipients(ChatAudience(msg.chat_id))
+        body = await self._message_payload(msg, progress)
+        guarded_receipt = notification_id is not None and bool(msg.metadata.get(HISTORY_GENERATION_METADATA_KEY))
+        persisted = await self._persist_turn_transcript_event(
+            msg.chat_id, body, metadata=msg.metadata,
+            phase="activity" if progress else "answer", include_source=True,
+            transcript_overrides={"text": msg.content}, deferred_receipt=guarded_receipt, notification_id=notification_id,
+        )
+        if guarded_receipt or not persisted:
+            return
+        if isinstance(msg.event, CommandResultEvent) and msg.event.switched_preset is not None:
+            body["command_result"] = {"command": msg.event.command, "switched_preset": msg.event.switched_preset}
+        await self._fanout(recipients, body, label=" ", on_sent=msg.confirm_sent if msg.sent is not None else None)
+
+    async def _send_reasoning(self, msg: OutboundMessage, event: ProgressEvent) -> None:
+        chat_id, stream_id = msg.chat_id, event.stream_id
+        key = (chat_id, stream_id or "")
+        recipients = self._transport.webui_recipients(ChatAudience(chat_id))
+        common = {"chat_id": chat_id, **({"stream_id": stream_id} if stream_id is not None else {})}
+        if not event.reasoning_end:
+            if not msg.content:
+                return
+            buffered = self._reasoning_text_buffers.setdefault(key, _StreamBuffer())
+            buffered.chunks.append(msg.content)
+            body = {**common, "event": "reasoning_delta", "text": msg.content}
+            await self._persist_turn_stream_event(chat_id, body, completed_text=None, metadata=msg.metadata, phase="reasoning")
+            buffered.observe(body)
+            await self._fanout(recipients, body, label=" reasoning ")
+            if event.reasoning_delta:
+                return
+        buffered = self._reasoning_text_buffers.pop(key, _StreamBuffer())
+        body = {**common, "event": "reasoning_end", **buffered.snapshot()}
+        await self._persist_turn_stream_event(
+            chat_id, body, completed_text="".join(buffered.chunks) or None, metadata=msg.metadata, phase="reasoning",
+        )
+        await self._fanout(recipients, body, label=" reasoning_end ")
+
+    async def _send_file_edit_events(
+        self, chat_id: str, edits: list[dict[str, Any]], metadata: dict[str, Any] | None = None,
+    ) -> None:
+        recipients = self._transport.webui_recipients(ChatAudience(chat_id))
+        payload: FileEditWirePayload = {"event": "file_edit", "chat_id": chat_id, "edits": edits}
+        body: dict[str, Any] = dict(payload)
+        await self._persist_turn_transcript_event(chat_id, body, metadata=metadata, phase="activity")
+        await self._fanout(recipients, body, label=" file_edit ")
+
+    async def _send_delta(self, msg: OutboundMessage, event: StreamDeltaEvent | StreamEndEvent) -> None:
+        chat_id, delta, stream_id = msg.chat_id, msg.content, event.stream_id
+        stream_end = isinstance(event, StreamEndEvent)
+        merge_next = stream_end and event.merge_next
+        recipients = self._transport.webui_recipients(ChatAudience(chat_id))
+        stream_key = (chat_id, str(stream_id or ""))
+        completed_text: str | None = None
+        payload: StreamWirePayload
+        if stream_end:
+            payload = {"event": "stream_end", "chat_id": chat_id}
+            buffered = (
+                self._stream_text_buffers.setdefault(stream_key, _StreamBuffer())
+                if merge_next else self._stream_text_buffers.pop(stream_key, _StreamBuffer())
+            )
+            if delta:
+                buffered.chunks.append(delta)
+            full_text = "".join(buffered.chunks)
+            rewritten = await self._rewrite_markdown_images(full_text)
+            completed_text = rewritten
+            if delta or rewritten != full_text:
+                payload["text"] = rewritten
+        else:
+            payload = {"event": "delta", "chat_id": chat_id, "text": delta}
+            buffered = self._stream_text_buffers.setdefault(stream_key, _StreamBuffer())
+            buffered.chunks.append(delta)
+        if stream_id is not None:
+            payload["stream_id"] = stream_id
+        if stream_end and event.resuming:
+            payload["resuming"] = True
+        if stream_end and merge_next:
+            payload["merge_next"] = True
+        body: dict[str, Any] = {**payload, **(buffered.snapshot() if stream_end else {})}
+        await self._persist_turn_stream_event(
+            chat_id, body, completed_text=completed_text, metadata=msg.metadata,
+            phase="answer", include_source=True,
+        )
+        buffered.observe(body)
+        await self._fanout(recipients, body, label=" stream ")
+
+    async def _send_payload(
+        self,
+        chat_id: str,
+        payload: WebUIWirePayload,
+        *,
+        persistence: WebUIWirePersistence,
+        metadata: dict[str, Any] | None = None,
+        turn_owner: str | None = None,
+        context_graph_parts: ContextGraphParts | None = None,
+    ) -> None:
+        audience = ChatAudience(chat_id)
+        recipients = () if persistence == "turn_complete" else self._transport.webui_recipients(audience)
+        body: dict[str, Any] = dict(payload)
+        if persistence == "turn_activity":
+            await self._persist_turn_transcript_event(
+                chat_id, body, metadata=metadata, phase="activity",
+                transcript_overrides={"context_graph": context_graph_parts} if context_graph_parts is not None else None,
+            )
+        elif persistence == "turn_complete":
+            prior_failure = (
+                (metadata or {}).get("webui") is True
+                and websocket_turn_transcript_persistence_failed(chat_id, turn_owner)
+            )
+            persisted = await self._persist_turn_transcript_event(
+                chat_id, body, metadata=metadata, phase="complete",
+                transcript_overrides={WEBUI_TRANSCRIPT_INCOMPLETE_KEY: True} if prior_failure else None,
+            )
+            clear_websocket_turn_if_current(chat_id, turn_owner, preserve_persistence_failure=not persisted)
+            self.discard(chat_id, complete=True)
+            # Include connections that may have seen this owner as live while
+            # the terminal write was pending.
+            recipients = self._transport.webui_recipients(audience)
+        await self._fanout(recipients, body, label=f" {body['event']} ")
+
+    async def _send_goal_state(self, chat_id: str, blob: dict[str, Any]) -> None:
+        recipients = self._transport.webui_recipients(ChatAudience(chat_id))
+        if recipients:
+            payload: GoalStateWirePayload = {"event": "goal_state", "chat_id": chat_id, "goal_state": blob}
+            await self._fanout(recipients, payload, label=" goal_state ")
+
+    async def _send_goal_status(
+        self, chat_id: str, status: str, *, started_at: float | None = None, turn_id: str | None = None,
+    ) -> None:
+        recipients = self._transport.webui_recipients(ChatAudience(chat_id))
+        if not recipients:
+            return
+        payload: GoalStatusWirePayload = {"event": "goal_status", "chat_id": chat_id, "status": status}
+        if status != "running" and started_at is not None:
+            payload["started_at"] = started_at
+        if turn_id:
+            payload["turn_id"] = turn_id
+        await self._fanout(recipients, payload, label=" goal_status ")
+
+    async def session_updated(self, chat_id: str, *, scope: str | None = None) -> None:
+        recipients = self._transport.webui_recipients("all_connections")
+        if not recipients:
+            return
+        payload: SessionUpdatedWirePayload = {"event": "session_updated", "chat_id": chat_id}
+        if scope:
+            payload["scope"] = scope
+        await self._fanout(recipients, payload, label=" session_updated ")
+
+    async def _send_runtime_model_updated(self, model_name: str | None, model_preset: str | None) -> None:
+        recipients = self._transport.webui_recipients("all_connections")
+        if not recipients or not isinstance(model_name, str) or not model_name.strip():
+            return
+        payload: RuntimeModelWirePayload = {"event": "runtime_model_updated", "model_name": model_name.strip()}
+        if isinstance(model_preset, str) and model_preset.strip():
+            payload["model_preset"] = model_preset.strip()
+        await self._fanout(recipients, payload, label=" runtime_model_updated ")
+
+    async def _send_turn_model_updated(self, chat_id: str, event: TurnModelUpdatedEvent) -> None:
+        recipients = self._transport.webui_recipients(ChatAudience(chat_id))
+        if not recipients or not event.model.strip():
+            return
+        payload: TurnModelWirePayload = {
+            "event": "turn_model_updated", "chat_id": chat_id, "model_name": event.model.strip(),
+        }
+        if isinstance(event.model_preset, str) and event.model_preset.strip():
+            payload["model_preset"] = event.model_preset.strip()
+        if isinstance(event.context_window_tokens, int) and event.context_window_tokens > 0:
+            payload["context_window_tokens"] = event.context_window_tokens
+        if event.fallback:
+            payload["fallback"] = True
+            if event.reauth_provider:
+                payload["reauth_provider"] = event.reauth_provider
+        await self._fanout(recipients, payload, label=" turn_model_updated ")

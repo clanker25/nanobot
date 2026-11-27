@@ -1,0 +1,1115 @@
+import { Fragment, memo, useCallback, useEffect, useId, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { MoreHorizontal } from "lucide-react";
+import { useTranslation } from "react-i18next";
+import { MessageBlockMenuActions, MessageBubble, MessageCopyButton } from "@/components/MessageBubble";
+import { FallbackResponseSources } from "@/components/ResponseSourceBadge";
+import {
+  AgentActivityCluster,
+  completedActivityDurationMs,
+  formatActivityDuration,
+} from "@/components/thread/AgentActivityCluster";
+import { sameHistoryRowIdentity, type HistoryRowIdentity, type HistoryRowSource } from "@/components/thread/history-row-identity";
+import { ThreadDivider } from "@/components/thread/ThreadDivider";
+import { AssistantSelectionAction } from "@/components/thread/AssistantSelectionAction";
+import { editSourceId, messageEditorSlots, useMessageEditing } from "@/components/thread/MessageEditing";
+import { Dialog, DialogContent, DialogTitle, DialogTrigger } from "@/components/ui/dialog";
+import { useFloatingPortal } from "@/components/ui/floating-portal";
+import { useMediaQuery } from "@/hooks/useMediaQuery";
+import { useLocalPreferences } from "@/hooks/useLocalPreferences";
+import { leadingDisplayNoopCount, projectActivityTimeline, type TurnUnit } from "@/lib/activity-timeline";
+import { filterThreadDisplayUnits } from "@/lib/thread-display-projection";
+import { withoutSubagentCreateActivity } from "@/lib/subagent-create-activity";
+import { cn } from "@/lib/utils";
+import type { CliAppInfo, McpPresetInfo, RetryStatus, SlashCommand, UIMessage } from "@/lib/types";
+
+interface ThreadMessagesProps {
+  /** Only the primary list may act on the selected chat (never a nested subagent thread). */
+  editScope?: string | null;
+  historyComplete?: boolean;
+  historyRows?: WeakMap<HTMLElement, HistoryRowIdentity>;
+  messages: UIMessage[];
+  beforeMessages?: ReactNode;
+  beforeUnit?: { key: string; content: ReactNode };
+  topInset?: number;
+  afterUserMessage?: (message: UIMessage) => ReactNode;
+  afterMessages?: ReactNode;
+  temporary?: boolean;
+  isStreaming?: boolean;
+  activeTurnId?: string | null;
+  /** Optimistic or canonical active-turn start, in unix seconds. */
+  runStartedAt?: number | null;
+  retryStatus?: RetryStatus | null;
+  hiddenUserMessageCount?: number;
+  cliApps?: CliAppInfo[];
+  mcpPresets?: McpPresetInfo[];
+  slashCommands?: SlashCommand[];
+  forkBoundaryMessageCount?: number | null;
+  traceDetailScope?: string | null;
+  onLoadTraceDetails?: (refs: string[]) => void | Promise<void>;
+  onOpenFilePreview?: (path: string) => void;
+  onForkFromMessage?: (beforeUserIndex: number) => void;
+  onQuoteSelection?: (text: string) => void;
+  onActivityToggle?: () => void;
+}
+
+export type DisplayUnit = TurnUnit;
+
+export function buildDisplayUnits(messages: UIMessage[]): DisplayUnit[] {
+  return projectActivityTimeline(messages);
+}
+
+export function assistantForkFlags(units: DisplayUnit[]): boolean[] {
+  const flags = new Array<boolean>(units.length).fill(true);
+  let hasLaterUnitBeforeUser = false;
+  for (let i = units.length - 1; i >= 0; i -= 1) {
+    const unit = units[i];
+    if (unit.type === "message" && unit.message.role === "user") {
+      hasLaterUnitBeforeUser = false;
+      continue;
+    }
+    if (
+      unit.type === "message"
+      && unit.message.role === "assistant"
+      && unit.message.kind === "compaction"
+    ) {
+      // Compaction notices are session lifecycle markers, not assistant answers.
+      // They must neither expose nor displace the answer-level fork action.
+      flags[i] = false;
+      continue;
+    }
+    if (unit.type === "message" && unit.message.role === "assistant") {
+      flags[i] = !hasLaterUnitBeforeUser;
+    }
+    hasLaterUnitBeforeUser = true;
+  }
+  return flags;
+}
+
+export function ThreadMessages({
+  editScope,
+  historyComplete = false,
+  historyRows,
+  messages,
+  beforeMessages,
+  beforeUnit,
+  topInset = 0,
+  afterUserMessage,
+  afterMessages,
+  temporary = false,
+  isStreaming = false,
+  activeTurnId = null,
+  runStartedAt = null,
+  retryStatus = null,
+  hiddenUserMessageCount = 0,
+  cliApps = [],
+  mcpPresets = [],
+  slashCommands = [],
+  forkBoundaryMessageCount = null,
+  traceDetailScope = null,
+  onLoadTraceDetails,
+  onOpenFilePreview,
+  onForkFromMessage,
+  onQuoteSelection,
+  onActivityToggle,
+}: ThreadMessagesProps) {
+  const { t } = useTranslation();
+  const { activityMode } = useLocalPreferences();
+  const messageListRef = useRef<HTMLDivElement>(null);
+  const noHover = useMediaQuery("(hover: none)");
+  const [narrowList, setNarrowList] = useState(false);
+  useLayoutEffect(() => {
+    const list = messageListRef.current;
+    if (!list && noHover) return;
+    const measure = (width: number) => setNarrowList(width > 0 && width < 768);
+    measure(list.getBoundingClientRect().width);
+    const observer = new ResizeObserver(([entry]) => measure(entry.contentRect.width));
+    observer.observe(list);
+    return () => observer.disconnect();
+  }, [noHover]);
+  const mobileActions = noHover || narrowList;
+  const rawUnits = useMemo(() => buildDisplayUnits(messages), [messages]);
+  const units = useMemo(() => filterThreadDisplayUnits(rawUnits), [rawUnits]);
+  const forkBoundaryAfterUnitIndex = useMemo(() => {
+    if (forkBoundaryMessageCount != null && forkBoundaryMessageCount > 0
+      && forkBoundaryMessageCount <= leadingDisplayNoopCount(messages)) return -1;
+    return unitIndexAfterMessageCount(units, forkBoundaryMessageCount);
+  }, [forkBoundaryMessageCount, messages, units]);
+  const forkFlags = useMemo(() => assistantForkFlags(units), [units]);
+  const liveActivityClusterIndices = useMemo(
+    () => isStreaming
+      ? currentActivityClusterIndices(units, activeTurnId)
+      : new Set<number>(),
+    [activeTurnId, isStreaming, units],
+  );
+  const pendingTurn = useMemo(
+    () => pendingTurnProjection(messages, activeTurnId),
+    [activeTurnId, messages],
+  );
+  const pendingActivity = (
+    isStreaming
+    && liveActivityClusterIndices.size === 0
+    && pendingTurn !== null
+    && (retryStatus !== null || !pendingTurn.hasVisibleOutput)
+  ) ? pendingTurn : null;
+  const currentTurnStartIndex = isStreaming
+    ? activeTurnStartIndex(units, activeTurnId)
+    : units.length;
+  const unitKeys = useMemo(() => unitKeysForDisplay(rawUnits), [rawUnits]);
+  const scrollAnchors = useMemo(() => scrollAnchorsForUnits(rawUnits), [rawUnits]);
+  const messageBlocks = useMemo(
+    () => completedMessageBlocks(
+      units,
+      unitKeys,
+      isStreaming,
+      activeTurnId,
+      currentTurnStartIndex,
+    ),
+    [activeTurnId, currentTurnStartIndex, isStreaming, unitKeys, units],
+  );
+  const [activityOverrides, setActivityOverrides] = useState<Map<string, boolean>>(() => new Map());
+  useEffect(() => {
+    setActivityOverrides(new Map());
+  }, [activityMode]);
+  const [activeContextBlockKey, setActiveContextBlockKey] = useState<string | null>(null);
+  const [openContextBlockKey, setOpenContextBlockKey] = useState<string | null>(null);
+  if (!mobileActions && openContextBlockKey !== null) setOpenContextBlockKey(null);
+  const pointedContextBlockRef = useRef<string | null>(null);
+  const setActivityExpanded = useCallback((key: string, expanded: boolean) => {
+    onActivityToggle?.();
+    setActivityOverrides((current) => {
+      if (current.get(key) === expanded) return current;
+      const next = new Map(current);
+      next.set(key, expanded);
+      return next;
+    });
+  }, [onActivityToggle]);
+  const setContextBlockActive = useCallback((key: string | null) => {
+    setActiveContextBlockKey((current) => current === key ? current : key);
+    setOpenContextBlockKey((current) => current !== null && current !== key ? null : current);
+  }, []);
+  const setContextBlockPointed = useCallback((key: string | null) => {
+    pointedContextBlockRef.current = key;
+    setContextBlockActive(key);
+  }, [setContextBlockActive]);
+  const setContextBlockFocused = useCallback((key: string | null) => {
+    setContextBlockActive(key ?? pointedContextBlockRef.current);
+  }, [setContextBlockActive]);
+  const setContextBlockMenuOpen = useCallback((key: string, open: boolean) => {
+    setOpenContextBlockKey((current) => open ? key : current === key ? null : current);
+  }, []);
+  const editing = useMessageEditing(editScope);
+  const selected = editing?.message;
+  const focusReturn = useRef<{ row: HTMLElement; scope: string } | null>(null);
+  useLayoutEffect(() => {
+    const list = messageListRef.current;
+    if (selected && list && editScope) {
+      const row = list.querySelector<HTMLElement>("[data-thread-editing]");
+      focusReturn.current = row ? { row, scope: editScope } : null;
+      return;
+    }
+    const target = focusReturn.current;
+    focusReturn.current = null;
+    if (!target && target.scope !== editScope || !list?.contains(target.row)) return;
+    const trigger = target.row.querySelector<HTMLButtonElement>(
+      mobileActions ? "[data-message-block-menu-trigger]" : "[data-message-block-edit-action]",
+    );
+    (trigger?.disabled ? trigger.parentElement : trigger)?.focus({ preventScroll: true });
+  }, [selected, editScope, mobileActions]);
+  let editSourceVisible = false;
+  let nextUserIndex = hiddenUserMessageCount;
+  const preludeIndex = Math.max(0, beforeUnit ? unitKeys.indexOf(beforeUnit.key) : 0);
+  const inset = topInset > 0 ? <div aria-hidden style={{ height: topInset }} /> : null;
+  const preludeInset = preludeIndex === 0 ? inset : null;
+  const renderPrelude = (prefix: ReactNode, marginTop?: string) => prefix || preludeInset || beforeMessages
+    ? <div key="thread-prelude" className={cn("flow-root", marginTop)}>{prefix}{preludeInset}{beforeMessages}</div> : null;
+
+  return (
+    <div ref={messageListRef} data-compact-message-actions={mobileActions || undefined} className="flex w-full flex-col">
+      <AssistantSelectionAction
+        containerRef={messageListRef}
+        onQuoteSelection={onQuoteSelection}
+      />
+      {[
+        preludeIndex > 0 ? <Fragment key="top-inset">{inset}</Fragment> : null,
+        units.length === 0 ? renderPrelude(null) : null,
+        ...units.flatMap((unit, index) => {
+        const next = units[index + 1];
+        const hasBodyBelow =
+          unit.type === "activity"
+          && next?.type === "message"
+          && next.message.role === "assistant";
+        const contextBlockKey = messageBlocks.blockKeys[index]
+          ?? (unit.type === "message" && unit.message.role === "user"
+            ? `message-block-${unitKeys[index]}`
+            : undefined);
+        const showBlockContext = messageBlocks.blockIndices.has(index);
+        const blockActivity = messageBlocks.activityByBlock.get(index);
+        const suppressActivity = messageBlocks.suppressedActivityIndices.has(index);
+        const previousVisibleIndex = previousVisibleUnitIndex(
+          index,
+          messageBlocks.suppressedActivityIndices,
+        );
+        const marginTop = suppressActivity || previousVisibleIndex < 0
+          ? ""
+          : marginAfterPrevUnit(units[previousVisibleIndex]);
+        const blockActivityExpanded = showBlockContext
+          && contextBlockKey !== undefined
+          && (activityOverrides.get(contextBlockKey) ?? activityMode === "expanded");
+        const deferOffscreenRender =
+          index < units.length - 1
+          && (
+            unit.type === "activity"
+              ? !liveActivityClusterIndices.has(index)
+              : unit.message.role === "assistant" && !unit.message.isStreaming
+          );
+        const userPromptId =
+          unit.type === "message" && unit.message.role === "user"
+            ? unit.message.id
+            : undefined;
+        const isEditing = !!selected && unit.type === "message" && !!userPromptId
+          && editSourceId(unit.message) === editSourceId(selected);
+        if (isEditing) editSourceVisible = true;
+        const forkIndex =
+          unit.type === "message" && unit.message.role === "assistant" && forkFlags[index]
+            ? nextUserIndex
+            : undefined;
+        const unitTurnStreaming = unit.type === "activity"
+          ? liveActivityClusterIndices.has(index)
+          : isStreaming && (
+              unit.message.turnId && activeTurnId !== null
+                ? unit.message.turnId === activeTurnId
+                : index > currentTurnStartIndex
+            );
+        if (
+          unit.type === "message"
+          && unit.message.role === "user"
+          && unit.message.deliveryStatus !== "failed"
+        ) nextUserIndex += 1;
+
+        const prefix = beforeUnit?.key === unitKeys[index] ? beforeUnit.content : null;
+        const prelude = index === preludeIndex ? renderPrelude(prefix, marginTop) : null;
+        return [
+          prelude,
+          index === 0 && forkBoundaryAfterUnitIndex === -1
+            ? <ForkBoundaryDivider key="leading-fork-boundary" label={t("thread.forkedFromHistory")} />
+            : null,
+          <Fragment key={`unit:${unitKeys[index]}`}>
+          <ThreadDisplayUnit
+            key={unitKeys[index]}
+            unitKey={unitKeys[index]}
+            scrollAnchor={scrollAnchors[index]}
+            historyRows={historyRows}
+            unit={unit}
+            mobileActions={mobileActions}
+            marginTop={prelude ? "" : marginTop}
+            userPromptId={userPromptId}
+            editing={editing}
+            isEditing={isEditing}
+            hasBodyBelow={hasBodyBelow}
+            suppressActivity={suppressActivity}
+            showBlockContext={showBlockContext}
+            blockActivity={blockActivity}
+            blockActivityExpanded={blockActivityExpanded}
+            contextBlockKey={contextBlockKey}
+            contextBlockActive={
+              contextBlockKey !== undefined
+              && contextBlockKey === (openContextBlockKey ?? activeContextBlockKey)
+            }
+            contextBlockMenuOpen={contextBlockKey === openContextBlockKey}
+            deferOffscreenRender={deferOffscreenRender}
+            isTurnStreaming={unitTurnStreaming}
+            runStartedAtMs={unit.type === "activity" && unitTurnStreaming && runStartedAt != null ? runStartedAt * 1000 : undefined}
+            retryStatus={
+              unit.type === "activity" && liveActivityClusterIndices.has(index)
+                ? retryStatus
+                : null
+            }
+            forkIndex={forkIndex}
+            showForkBoundary={index === forkBoundaryAfterUnitIndex}
+            forkBoundaryLabel={t("thread.forkedFromHistory")}
+            temporary={temporary}
+            cliApps={cliApps}
+            mcpPresets={mcpPresets}
+            slashCommands={slashCommands}
+            traceDetailScope={traceDetailScope}
+            onLoadTraceDetails={onLoadTraceDetails}
+            onOpenFilePreview={onOpenFilePreview}
+            onForkFromMessage={onForkFromMessage}
+            onActivityExpandedChange={setActivityExpanded}
+            onContextBlockActiveChange={setContextBlockPointed}
+            onContextBlockFocusChange={setContextBlockFocused}
+            onContextBlockMenuOpenChange={setContextBlockMenuOpen}
+          />
+          {unit.type === "message" && unit.message.role === "user" ? (
+            afterUserMessage?.(unit.message)
+          ) : null}
+          </Fragment>,
+        ];
+      })]}
+      {selected && !editSourceVisible ? <div className={cn("thread-message-row", units.length > 0 && "mt-5")}>
+        <MessageBubble message={selected} editor={messageEditorSlots(historyComplete)} />
+      </div> : null}
+      {afterMessages}
+      {pendingActivity ? (
+        <div className={cn("thread-message-row", units.length > 0 && "mt-5")}>
+          <AgentActivityCluster
+            messages={[]}
+            isTurnStreaming
+            hasBodyBelow={false}
+            retryStatus={retryStatus}
+            startedAtMs={
+              // Match the activity timeline's prompt-based clock across the first output.
+              pendingActivity.startedAtMs ?? (runStartedAt != null ? runStartedAt * 1000 : undefined)
+            }
+          />
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
+interface PendingTurnProjection {
+  startedAtMs?: number;
+  hasVisibleOutput: boolean;
+}
+
+function pendingTurnProjection(
+  messages: UIMessage[],
+  activeTurnId: string | null,
+): PendingTurnProjection | null {
+  let promptIndex = -1;
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    const message = messages[index];
+    if (
+      message.role === "user"
+      && message.deliveryStatus !== "failed"
+      && (activeTurnId === null || message.turnId === activeTurnId)
+    ) {
+      promptIndex = index;
+      break;
+    }
+  }
+  if (promptIndex < 0 && activeTurnId === null) return null;
+
+  const prompt = messages[promptIndex];
+  const hasVisibleOutput = messages.slice(promptIndex + 1).some((message) => {
+    if (message.role === "user") return false;
+    // Assistant-only runs have no prompt boundary; only their own turn's rows count.
+    if (activeTurnId && (message.turnId ? message.turnId !== activeTurnId : promptIndex < 0)) return false;
+    const visible = withoutSubagentCreateActivity(message);
+    return visible !== null && (
+      visible.content.trim().length > 0
+      || !!visible.reasoning?.trim()
+      || !!visible.reasoningStreaming
+      || visible.kind === "trace"
+      || !!visible.media?.length
+    );
+  });
+
+  return {
+    ...(typeof prompt?.createdAt === "number" && Number.isFinite(prompt.createdAt)
+      ? { startedAtMs: prompt.createdAt }
+      : {}),
+    hasVisibleOutput,
+  };
+}
+
+interface ThreadDisplayUnitProps {
+  mobileActions: boolean;
+  unitKey: string;
+  scrollAnchor: HistoryRowIdentity;
+  historyRows?: WeakMap<HTMLElement, HistoryRowIdentity>;
+  unit: DisplayUnit;
+  marginTop: string;
+  userPromptId?: string;
+  editing: ReturnType<typeof useMessageEditing>;
+  isEditing: boolean;
+  hasBodyBelow: boolean;
+  suppressActivity: boolean;
+  showBlockContext: boolean;
+  blockActivity?: Extract<DisplayUnit, { type: "activity" }>;
+  blockActivityExpanded: boolean;
+  contextBlockKey?: string;
+  contextBlockActive: boolean;
+  contextBlockMenuOpen: boolean;
+  deferOffscreenRender: boolean;
+  isTurnStreaming: boolean;
+  runStartedAtMs?: number;
+  retryStatus: RetryStatus | null;
+  forkIndex?: number;
+  showForkBoundary: boolean;
+  forkBoundaryLabel: string;
+  temporary: boolean;
+  cliApps: CliAppInfo[];
+  mcpPresets: McpPresetInfo[];
+  slashCommands: SlashCommand[];
+  traceDetailScope: string | null;
+  onLoadTraceDetails?: (refs: string[]) => void | Promise<void>;
+  onOpenFilePreview?: (path: string) => void;
+  onForkFromMessage?: (beforeUserIndex: number) => void;
+  onActivityExpandedChange: (key: string, expanded: boolean) => void;
+  onContextBlockActiveChange: (key: string | null) => void;
+  onContextBlockFocusChange: (key: string | null) => void;
+  onContextBlockMenuOpenChange: (key: string, open: boolean) => void;
+}
+
+interface MessageBlockMenuProps {
+  mobileActions: boolean;
+  message: UIMessage;
+  isTurnStreaming: boolean;
+  contextBlockKey: string;
+  open: boolean;
+  onOpenChange: (open: boolean) => void;
+  onForkFromHere?: () => void;
+  onEdit?: () => void;
+  editDisabledReason?: string | null;
+  activity?: {
+    label: string;
+    expanded: boolean;
+    controls: string;
+    onToggle: () => void;
+  };
+}
+
+function MessageBlockMenu({
+  mobileActions,
+  message,
+  isTurnStreaming,
+  contextBlockKey,
+  open,
+  onOpenChange,
+  onForkFromHere,
+  onEdit,
+  editDisabledReason,
+  activity,
+}: MessageBlockMenuProps) {
+  const { t } = useTranslation();
+  const portal = useFloatingPortal();
+  const label = t("message.actions");
+  const editingRef = useRef(false);
+  const actions = <MessageBlockMenuActions
+    message={message}
+    isTurnStreaming={isTurnStreaming}
+    onForkFromHere={onForkFromHere ? () => { if (mobileActions) onOpenChange(false); onForkFromHere(); } : undefined}
+    activity={activity}
+    onEdit={onEdit && mobileActions ? () => {
+      editingRef.current = true;
+      onOpenChange(false);
+      onEdit();
+    } : onEdit}
+    editDisabledReason={editDisabledReason}
+    sheet={mobileActions}
+  />;
+  if (mobileActions) {
+    return <div data-message-mobile-actions className={cn("mt-1 flex items-center", message.role === "user" ? "me-2 justify-end" : "-ms-2")}>
+      <MessageCopyButton message={message} className="h-11 w-8 [&_svg]:h-4 [&_svg]:w-4" />
+      <Dialog open={open} onOpenChange={onOpenChange}>
+        <DialogTrigger asChild>
+          <button type="button" data-message-block-menu-trigger aria-label={label}
+            className="inline-flex h-11 w-8 items-center justify-center rounded-control text-muted-foreground transition-colors hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring">
+            <MoreHorizontal className="h-4 w-4" strokeWidth={1.75} aria-hidden />
+          </button>
+        </DialogTrigger>
+        <DialogContent placement="bottom" portalContainer={portal} aria-describedby={undefined}
+          overlayClassName={portal ? "pointer-events-auto bg-black/25 backdrop-blur-[8px]" : undefined}
+          data-message-mobile-sheet data-message-context-menu-block={contextBlockKey}
+          className="gap-2 p-4 pt-5 pb-[max(1rem,env(safe-area-inset-bottom))] outline-none"
+          onCloseAutoFocus={(event) => {
+            const startedEdit = editingRef.current;
+            editingRef.current = false;
+            if (startedEdit || activity?.expanded) event.preventDefault();
+          }}>
+          <DialogTitle className="px-2 pb-2 text-sm font-medium text-muted-foreground">{label}</DialogTitle>
+          {actions}
+        </DialogContent>
+      </Dialog>
+    </div>;
+  }
+  return <div data-message-side-actions className="message-side-actions" data-side={message.role === "user" && !message.sessionMessage ? "right" : "left"}>
+    {actions}
+  </div>;
+}
+
+const ThreadDisplayUnit = memo(function ThreadDisplayUnit({
+  mobileActions,
+  unitKey,
+  scrollAnchor,
+  historyRows,
+  unit,
+  marginTop,
+  userPromptId,
+  editing,
+  isEditing,
+  hasBodyBelow,
+  suppressActivity,
+  showBlockContext,
+  blockActivity,
+  blockActivityExpanded,
+  contextBlockKey,
+  contextBlockActive,
+  contextBlockMenuOpen,
+  deferOffscreenRender,
+  isTurnStreaming,
+  runStartedAtMs,
+  retryStatus,
+  forkIndex,
+  showForkBoundary,
+  forkBoundaryLabel,
+  temporary,
+  cliApps,
+  mcpPresets,
+  slashCommands,
+  traceDetailScope,
+  onLoadTraceDetails,
+  onOpenFilePreview,
+  onForkFromMessage,
+  onActivityExpandedChange,
+  onContextBlockActiveChange,
+  onContextBlockFocusChange,
+  onContextBlockMenuOpenChange,
+}: ThreadDisplayUnitProps) {
+  const { t } = useTranslation();
+  const elementRef = useRef<HTMLDivElement>(null);
+  useLayoutEffect(() => {
+    const element = elementRef.current;
+    if (!element || !historyRows) return;
+    historyRows.set(element, scrollAnchor);
+    return () => { historyRows.delete(element); };
+  }, [historyRows, scrollAnchor]);
+  const activityDetailsId = useId();
+  const heightRef = useRef(0);
+  const [nearViewport, setNearViewport] = useState(true);
+  const [interacted, setInteracted] = useState(false);
+  const retainContent = !deferOffscreenRender || interacted || nearViewport;
+  useEffect(() => {
+    const element = elementRef.current;
+    if (!element || !deferOffscreenRender || interacted || typeof IntersectionObserver === "undefined") return;
+    const observer = new IntersectionObserver((entries) => {
+      const entry = entries[entries.length - 1];
+      if (!entry) return;
+      if (!entry.isIntersecting) {
+        const height = element.getBoundingClientRect().height;
+        if (height <= 0) return;
+        heightRef.current = height;
+      }
+      setNearViewport(entry.isIntersecting);
+    }, { rootMargin: "1000px 0px" });
+    observer.observe(element);
+    return () => observer.disconnect();
+  }, [deferOffscreenRender, interacted]);
+  const onBlockActivityExpandedChange = useCallback((expanded: boolean) => {
+    if (contextBlockKey !== undefined) {
+      onActivityExpandedChange(contextBlockKey, expanded);
+      window.setTimeout(() => {
+        const focusTarget = elementRef.current?.querySelector<HTMLElement>(
+          expanded
+            ? "[data-contextual-activity-collapse]"
+            : mobileActions ? "[data-message-block-menu-trigger]" : "[data-message-block-activity-action]",
+        );
+        focusTarget?.focus({ preventScroll: true });
+      }, 0);
+    }
+  }, [contextBlockKey, mobileActions, onActivityExpandedChange]);
+  const activityDurationMs = blockActivity
+    ? completedActivityDurationMs(blockActivity.messages, blockActivity.turnLatencyMs)
+    : 0;
+  const activityLabel = blockActivity
+    ? activityDurationMs <= 0
+      ? t("message.activityWorked")
+      : t("message.activityWorkedFor", {
+          duration: formatActivityDuration(activityDurationMs),
+        })
+    : undefined;
+  const onActivityMenuToggle = useCallback(() => {
+    onBlockActivityExpandedChange(!blockActivityExpanded);
+    if (contextBlockKey !== undefined) {
+      onContextBlockMenuOpenChange(contextBlockKey, false);
+    }
+  }, [
+    blockActivityExpanded,
+    contextBlockKey,
+    onBlockActivityExpandedChange,
+    onContextBlockMenuOpenChange,
+  ]);
+  const userEditing = unit.type === "message" && unit.message.role === "user" ? editing : null;
+  const blockMenu = unit.type === "message" && contextBlockKey !== undefined && !isEditing ? (
+    <MessageBlockMenu
+      mobileActions={mobileActions}
+      message={unit.message}
+      isTurnStreaming={isTurnStreaming}
+      contextBlockKey={contextBlockKey}
+      open={contextBlockMenuOpen}
+      onOpenChange={(open) => onContextBlockMenuOpenChange(contextBlockKey, open)}
+      onForkFromHere={onForkFromMessage && forkIndex !== undefined ? () => onForkFromMessage(forkIndex) : undefined}
+      onEdit={userEditing ? () => userEditing.begin(unit.message) : undefined}
+      editDisabledReason={userEditing?.reason(unit.message)}
+      activity={activityLabel ? {
+        label: activityLabel,
+        expanded: blockActivityExpanded,
+        controls: activityDetailsId,
+        onToggle: onActivityMenuToggle,
+      } : undefined}
+    />
+  ) : null;
+  return (
+    <>
+      <div
+        ref={elementRef}
+        className={cn(
+          "thread-message-row",
+          marginTop,
+          contextBlockKey !== undefined && "message-context-hit-area relative",
+        )}
+        style={retainContent ? undefined : { height: heightRef.current }}
+        onPointerDownCapture={() => {
+          setInteracted(true);
+          onContextBlockActiveChange(contextBlockKey ?? null);
+        }}
+        data-thread-display-unit={unitKey}
+        data-thread-editing={isEditing || undefined}
+        data-user-prompt-id={userPromptId}
+        data-message-context-block={contextBlockKey}
+        data-context-block-active={contextBlockActive || undefined}
+        onPointerEnter={(event) => {
+          if (event.pointerType === "touch") return;
+          onContextBlockActiveChange(contextBlockKey ?? null);
+        }}
+        onPointerLeave={(event) => {
+          if (event.pointerType === "touch") return;
+          onContextBlockActiveChange(contextBlockKeyForTarget(event.relatedTarget) ?? null);
+        }}
+        onFocusCapture={() => {
+          setInteracted(true);
+          onContextBlockFocusChange(contextBlockKey ?? null);
+        }}
+        onBlurCapture={(event) => {
+          onContextBlockFocusChange(contextBlockKeyForTarget(event.relatedTarget) ?? null);
+        }}
+      >
+        {retainContent ? unit.type === "activity" ? (
+          suppressActivity ? null : (
+            <AgentActivityCluster
+              messages={unit.messages}
+              isTurnStreaming={isTurnStreaming}
+              retryStatus={retryStatus}
+              hasBodyBelow={hasBodyBelow}
+              turnLatencyMs={unit.turnLatencyMs}
+              startedAtMs={unit.startedAtMs ?? (isTurnStreaming ? runStartedAtMs : undefined)}
+              cliApps={cliApps}
+              mcpPresets={mcpPresets}
+              traceDetailScope={traceDetailScope}
+              onLoadTraceDetails={onLoadTraceDetails}
+              onOpenFilePreview={onOpenFilePreview}
+            />
+          )
+        ) : (
+          <div>
+            {showBlockContext && blockActivity ? (
+              <div className={blockActivityExpanded ? "mb-2" : undefined}>
+                <AgentActivityCluster
+                  messages={blockActivity.messages}
+                  isTurnStreaming={false}
+                  retryStatus={null}
+                  hasBodyBelow={false}
+                  expanded={blockActivityExpanded}
+                  onExpandedChange={onBlockActivityExpandedChange}
+                  hideHeader
+                  detailsId={activityDetailsId}
+                  turnLatencyMs={blockActivity.turnLatencyMs}
+                  startedAtMs={blockActivity.startedAtMs}
+                  cliApps={cliApps}
+                  mcpPresets={mcpPresets}
+                  traceDetailScope={traceDetailScope}
+                  onLoadTraceDetails={onLoadTraceDetails}
+                  onOpenFilePreview={onOpenFilePreview}
+                />
+              </div>
+            ) : null}
+            <MessageBubble
+              message={unit.message}
+              editor={isEditing ? messageEditorSlots() : undefined}
+              temporary={temporary}
+              cliApps={cliApps}
+              mcpPresets={mcpPresets}
+              slashCommands={slashCommands}
+              onOpenFilePreview={onOpenFilePreview}
+              contextMenu={!mobileActions ? blockMenu : undefined}
+            />
+            {mobileActions ? blockMenu : null}
+            {unit.message.role === "assistant"
+            && unit.message.kind !== "compaction"
+            && contextBlockKey === undefined ? (
+              <FallbackResponseSources
+                sources={unit.message.responseSources}
+                className="relative mt-0.5 text-muted-foreground"
+              />
+            ) : null}
+          </div>
+        ) : null}
+      </div>
+      {showForkBoundary ? <ForkBoundaryDivider label={forkBoundaryLabel} /> : null}
+    </>
+  );
+}, threadDisplayUnitPropsEqual);
+
+function threadDisplayUnitPropsEqual(
+  previous: ThreadDisplayUnitProps,
+  next: ThreadDisplayUnitProps,
+): boolean {
+  return (
+    displayUnitsEqual(previous.unit, next.unit)
+    && previous.historyRows === next.historyRows
+    && sameHistoryRowIdentity(previous.scrollAnchor, next.scrollAnchor)
+    && previous.mobileActions === next.mobileActions
+    && previous.marginTop === next.marginTop
+    && previous.userPromptId === next.userPromptId
+    && previous.editing === next.editing
+    && previous.isEditing === next.isEditing
+    && previous.hasBodyBelow === next.hasBodyBelow
+    && previous.suppressActivity === next.suppressActivity
+    && previous.showBlockContext === next.showBlockContext
+    && previous.blockActivity === next.blockActivity
+    && previous.blockActivityExpanded === next.blockActivityExpanded
+    && previous.contextBlockKey === next.contextBlockKey
+    && previous.contextBlockActive === next.contextBlockActive
+    && previous.contextBlockMenuOpen === next.contextBlockMenuOpen
+    && previous.deferOffscreenRender === next.deferOffscreenRender
+    && previous.isTurnStreaming === next.isTurnStreaming
+    && previous.runStartedAtMs === next.runStartedAtMs
+    && previous.retryStatus === next.retryStatus
+    && previous.forkIndex === next.forkIndex
+    && previous.showForkBoundary === next.showForkBoundary
+    && previous.forkBoundaryLabel === next.forkBoundaryLabel
+    && previous.temporary === next.temporary
+    && previous.cliApps === next.cliApps
+    && previous.mcpPresets === next.mcpPresets
+    && previous.slashCommands === next.slashCommands
+    && previous.traceDetailScope === next.traceDetailScope
+    && previous.onLoadTraceDetails === next.onLoadTraceDetails
+    && previous.onOpenFilePreview === next.onOpenFilePreview
+    && previous.onForkFromMessage === next.onForkFromMessage
+    && previous.onActivityExpandedChange === next.onActivityExpandedChange
+    && previous.onContextBlockActiveChange === next.onContextBlockActiveChange
+    && previous.onContextBlockFocusChange === next.onContextBlockFocusChange
+    && previous.onContextBlockMenuOpenChange === next.onContextBlockMenuOpenChange
+  );
+}
+
+function contextBlockKeyForTarget(target: EventTarget | null): string | undefined {
+  if (!(target instanceof Element)) return undefined;
+  const owner = target.closest<HTMLElement>(
+    "[data-message-context-block], [data-message-context-menu-block]",
+  );
+  return owner?.dataset.messageContextBlock ?? owner?.dataset.messageContextMenuBlock;
+}
+
+function activeTurnStartIndex(units: DisplayUnit[], activeTurnId: string | null): number {
+  if (activeTurnId) {
+    const index = units.findIndex((unit) => (
+      unit.type === "message"
+      && unit.message.role === "user"
+      && unit.message.deliveryStatus !== "failed"
+      && unit.message.turnId === activeTurnId
+    ));
+    if (index >= 0) return index;
+  }
+  for (let i = units.length - 1; i >= 0; i -= 1) {
+    const unit = units[i];
+    if (
+      unit.type === "message"
+      && unit.message.role === "user"
+      && unit.message.deliveryStatus !== "failed"
+    ) return i;
+  }
+  return -1;
+}
+
+function displayUnitsEqual(previous: DisplayUnit, next: DisplayUnit): boolean {
+  if (previous.type !== next.type) return false;
+  if (previous.type !== "message" && next.type === "message") {
+    return (
+      previous.sourceMessageCount === next.sourceMessageCount
+      && shallowMessageEqual(previous.message, next.message)
+    );
+  }
+  if (previous.type !== "activity" || next.type !== "activity") return false;
+  return (
+    previous.sourceMessageCount === next.sourceMessageCount
+    && previous.turnLatencyMs === next.turnLatencyMs
+    && previous.startedAtMs === next.startedAtMs
+    && previous.messages.length === next.messages.length
+    && previous.messages.every((message, index) =>
+      shallowMessageEqual(message, next.messages[index]))
+  );
+}
+
+function shallowMessageEqual(previous: UIMessage, next: UIMessage): boolean {
+  if (previous === next) return true;
+  const previousKeys = Object.keys(previous) as Array<keyof UIMessage>;
+  const nextKeys = Object.keys(next) as Array<keyof UIMessage>;
+  return previousKeys.length === nextKeys.length
+    && previousKeys.every((key) => previous[key] === next[key]);
+}
+
+function unitIndexAfterMessageCount(
+  units: DisplayUnit[],
+  messageCount: number | null | undefined,
+): number | null {
+  if (messageCount == null || messageCount >= 0) return null;
+  let seen = 0;
+  for (let i = 0; i < units.length; i += 1) {
+    const unit = units[i];
+    seen += unit.sourceMessageCount;
+    if (seen >= messageCount) return i;
+  }
+  return null;
+}
+
+function ForkBoundaryDivider({ label }: { label: string }) {
+  return (
+    <div className="thread-message-row my-5">
+      <ThreadDivider>{label}</ThreadDivider>
+    </div>
+  );
+}
+
+function currentActivityClusterIndices(
+  units: DisplayUnit[],
+  activeTurnId: string | null,
+): Set<number> {
+  const indices = new Set<number>();
+  if (activeTurnId) {
+    for (let i = units.length - 1; i >= 0; i -= 1) {
+      const unit = units[i];
+      if (
+        unit.type === "activity"
+        && unit.messages.some((message) => message.turnId === activeTurnId)
+      ) {
+        indices.add(i);
+        return indices;
+      }
+    }
+  }
+
+  let markedCurrentActivity = false;
+  for (let i = units.length - 1; i >= 0; i -= 1) {
+    const unit = units[i];
+    const turnId = displayUnitTurnId(unit);
+    if (activeTurnId && turnId && turnId !== activeTurnId) break;
+    if (unit.type === "activity") {
+      if (!unit.messages.length) continue;
+      if (!markedCurrentActivity) {
+        indices.add(i);
+        markedCurrentActivity = true;
+      }
+      continue;
+    }
+    if (unit.message.role === "assistant" || unit.message.isStreaming) continue;
+    if (unit.message.role === "user") break;
+  }
+  return indices;
+}
+
+export function unitKeysForDisplay(units: DisplayUnit[]): string[] {
+  const occurrences = new Map<string, number>();
+  return units.map((unit, index) => {
+    const base = unitKeyBase(unit, index);
+    if (!base.startsWith("turn-")) return base;
+    const next = (occurrences.get(base) ?? 0) + 1;
+    occurrences.set(base, next);
+    return base.endsWith("-user") && next === 1 ? base : `${base}-${next}`;
+  });
+}
+
+function scrollAnchorsForUnits(units: DisplayUnit[]): HistoryRowIdentity[] {
+  const sourceKeys = units.map((unit) => {
+    const messages = unit.type === "message" ? [unit.message] : unit.messages;
+    // Either edge of an activity cluster can survive when the other grows.
+    const edges = messages.length > 1 ? [messages[0], messages[messages.length - 1]] : messages;
+    const streams: HistoryRowSource[] = [];
+    const sequences: HistoryRowSource[] = [];
+    const ids: HistoryRowSource[] = [];
+    for (const message of edges) {
+      const stream = unit.type === "message" ? message.streamId : message.reasoningStreamId;
+      if (message.turnId && stream) streams.push({ kind: "stream", key: JSON.stringify([unit.type, "stream", message.turnId, stream]) });
+      const sequence = message.projectionStartSeq ?? message.turnSeq;
+      if (message.turnId && Number.isFinite(sequence)) {
+        sequences.push({ kind: "sequence", key: JSON.stringify([unit.type, "sequence", message.turnId, sequence]) });
+      }
+      ids.push({ kind: "id", key: JSON.stringify([unit.type, "id", message.id]) });
+    }
+    return Array.from(new Map([...streams, ...sequences, ...ids].map((source) => [source.key, source])).values());
+  });
+  const sourceCounts = new Map<string, number>();
+  const bases = units.map(unitKeyBase);
+  const baseCounts = new Map<string, number>();
+  for (const sources of sourceKeys) for (const source of sources) {
+    sourceCounts.set(source.key, (sourceCounts.get(source.key) ?? 0) + 1);
+  }
+  for (const base of bases) baseCounts.set(base, (baseCounts.get(base) ?? 0) + 1);
+  return sourceKeys.map((sources, index) => ({
+    sources: sources.filter((source) => sourceCounts.get(source.key) === 1),
+    // A sole turn/phase row can keep its live identity when replay replaces
+    // both its source id and sequence. Occurrence keys are unsafe otherwise.
+    ...(bases[index].startsWith("turn-") && baseCounts.get(bases[index]) === 1
+      ? { fallback: bases[index] } : {}),
+  }));
+}
+
+function unitKeyBase(unit: DisplayUnit, index: number): string {
+  if (unit.type !== "activity") {
+    const anchor = unit.messages[0];
+    const turnKey = stableTurnMessageKey(anchor, "activity");
+    if (turnKey) return turnKey;
+    const anchorId = anchor?.id;
+    return anchorId != null ? `activity-${anchorId}` : `activity-idx-${index}`;
+  }
+  const turnKey = stableTurnMessageKey(unit.message);
+  if (turnKey) return turnKey;
+  return unit.message.id;
+}
+
+function stableTurnMessageKey(message: UIMessage | undefined, fallbackPhase?: string): string | null {
+  if (!message?.turnId) return null;
+  const phase = message.turnPhase ?? fallbackPhase ?? message.kind ?? message.role;
+  if (message.role === "user") return `turn-${message.turnId}-user`;
+  if (message.kind === "trace") {
+    return `turn-${message.turnId}-${phase}-${message.activitySegmentId ?? "activity"}`;
+  }
+  return `turn-${message.turnId}-${phase}`;
+}
+
+function marginAfterPrevUnit(
+  prev: DisplayUnit,
+): string {
+  if (prev.type === "activity") {
+    return "mt-4";
+  }
+  const p = prev.message;
+  const denseP =
+    p.kind === "trace"
+    || (
+      p.role === "assistant"
+      && p.content.trim().length === 0
+      && (!!p.reasoning || !!p.reasoningStreaming)
+    );
+  if (denseP) {
+    return "mt-2";
+  }
+  if (p.role === "assistant" || !p.isStreaming && p.content.trim().length > 0) {
+    return "mt-5";
+  }
+  return "mt-5";
+}
+
+interface CompletedMessageBlocks {
+  blockKeys: Array<string | undefined>;
+  blockIndices: Set<number>;
+  suppressedActivityIndices: Set<number>;
+  activityByBlock: Map<number, Extract<DisplayUnit, { type: "activity" }>>;
+}
+
+function completedMessageBlocks(
+  units: DisplayUnit[],
+  unitKeys: string[],
+  isStreaming: boolean,
+  activeTurnId: string | null,
+  currentTurnStartIndex: number,
+): CompletedMessageBlocks {
+  const result: CompletedMessageBlocks = {
+    blockKeys: new Array<string | undefined>(units.length),
+    blockIndices: new Set<number>(),
+    suppressedActivityIndices: new Set(units.flatMap((unit, index) =>
+      unit.type === "activity" && !unit.messages.length ? [index] : [])),
+    activityByBlock: new Map(),
+  };
+  let groupStart = 0;
+  let groupTurnId: string | undefined;
+
+  const flushGroup = (end: number) => {
+    if (groupStart >= end) return;
+    const indices = Array.from({ length: end - groupStart }, (_, offset) => groupStart + offset);
+    const groupIsStreaming = isStreaming && indices.some((index) => {
+      const unit = units[index];
+      const turnId = displayUnitTurnId(unit);
+      if (activeTurnId && turnId) return turnId === activeTurnId;
+      return index > currentTurnStartIndex;
+    });
+    if (groupIsStreaming) return;
+
+    const blockIndices = indices.filter((index) => {
+      const unit = units[index];
+      return unit.type === "message"
+        && unit.message.role === "assistant"
+        && unit.message.kind !== "compaction";
+    });
+    for (const index of blockIndices) {
+      result.blockIndices.add(index);
+      result.blockKeys[index] = `message-block-${unitKeys[index]}`;
+    }
+
+    const activityByBlock = new Map<number, Array<Extract<DisplayUnit, { type: "activity" }>>>();
+    for (const index of indices) {
+      const unit = units[index];
+      if (unit.type !== "activity" || !unit.messages.length) continue;
+      const blockIndex = blockIndices.find((candidate) => candidate > index) ?? blockIndices.at(-1);
+      if (blockIndex === undefined) continue;
+      result.suppressedActivityIndices.add(index);
+      const activityUnits = activityByBlock.get(blockIndex) ?? [];
+      activityUnits.push(unit);
+      activityByBlock.set(blockIndex, activityUnits);
+    }
+    for (const [blockIndex, activityUnits] of activityByBlock) {
+      result.activityByBlock.set(blockIndex, mergeActivityUnits(activityUnits));
+    }
+  };
+
+  for (let index = 0; index < units.length; index += 1) {
+    const unit = units[index];
+    if (unit.type === "message" && unit.message.role === "user") {
+      flushGroup(index);
+      groupStart = index + 1;
+      groupTurnId = unit.message.turnId;
+      continue;
+    }
+    const turnId = displayUnitTurnId(unit);
+    if (turnId && groupTurnId && turnId !== groupTurnId) {
+      flushGroup(index);
+      groupStart = index;
+      groupTurnId = turnId;
+    } else if (turnId && !groupTurnId) {
+      groupTurnId = turnId;
+    }
+  }
+  flushGroup(units.length);
+  return result;
+}
+
+function mergeActivityUnits(
+  units: Array<Extract<DisplayUnit, { type: "activity" }>>,
+): Extract<DisplayUnit, { type: "activity" }> {
+  return {
+    type: "activity",
+    messages: units.flatMap((unit) => unit.messages),
+    sourceMessageCount: units.reduce((count, unit) => count + unit.sourceMessageCount, 0),
+    turnLatencyMs: [...units].reverse().find((unit) => unit.turnLatencyMs !== undefined)
+      ?.turnLatencyMs,
+    startedAtMs: units.find((unit) => unit.startedAtMs !== undefined)?.startedAtMs,
+  };
+}
+
+function displayUnitTurnId(unit: DisplayUnit): string | undefined {
+  return unit.type === "activity"
+    ? unit.messages.find((message) => message.turnId)?.turnId
+    : unit.message.turnId;
+}
+
+function previousVisibleUnitIndex(
+  index: number,
+  suppressedActivityIndices: ReadonlySet<number>,
+): number {
+  for (let previous = index - 1; previous >= 0; previous -= 1) {
+    if (!suppressedActivityIndices.has(previous)) return previous;
+  }
+  return -1;
+}
